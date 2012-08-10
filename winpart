@@ -1,0 +1,110 @@
+#!/bin/bash
+
+USAGE="usage: $(basename $0) [-hmu]
+       $(basename $0) [-hmu] -w command
+
+Shortcuts for working with windows partition defined in /etc/winpart/*.uuid.
+File in /etc/winpart should have name equal to the partition's UUID,
+and the contents should equal a 'mount point'.  The partition will be
+mounted at /media/<UUID>, and the script will add a symbolic link at
+the friendlier 'mount point' pointing to /media/<UUID>.
+
+where:
+	-h  Show this help text
+	-m  Mount the windows partition
+	-u  Unmount the windows partition
+	-w  Wrap the given command such that mounting of the windows
+	    partition is ensured before running the command.  If the
+	    partition was already mounted, don't do anything after running
+	    the command.  Otherwise, unmount the partition when done (if not
+	    in use by something else)."
+
+UUID=""
+MOUNT=""
+
+getConfig () {
+	if [[ $UUID = "" || $MOUNT = "" ]]; then
+		for file in /etc/winpart/*.uuid
+		do
+			if [[ -f $file ]]; then
+				# filename without extension
+				UUID=$(basename "$file")
+				UUID="${UUID%.*}"
+				# read first line
+				MOUNT=$(head -n 1 $file)
+				break
+			fi
+		done
+	fi	
+	if [[ $UUID = "" || $MOUNT = "" ]]; then
+		echo "Could not read config in /etc/winpart" 1>&2
+		exit 1
+	fi
+}
+
+makeSymLink () {
+	if [[ -L "$MOUNT" ]]; then
+		local mpath=`readlink -f $MOUNT`
+		local upath=`readlink -f "/media/$UUID"`
+		if [[ $mpath != $upath ]]; then
+			echo "$MOUNT symlink already exists and points elsewhere! Please remove it and try again." >&2
+			exit 1
+		fi
+		# otherwise, it points to the right place and we're done
+	elif [[ -e "$MOUNT" ]]; then
+		echo "$MOUNT file already exists! Please remove it and try again." >&2
+		exit 1
+	else
+		gksudo -- ln -s "/media/$UUID" "$MOUNT"
+	fi
+}
+
+wrap () {
+	getConfig
+	makeSymLink
+	local wasmounted=true
+	if !( grep -qs "/media/$UUID " /proc/mounts ); then
+		wasmounted=false
+		# mount the windows partition
+		if !( udisks --mount "/dev/disk/by-uuid/$UUID" >/dev/null ); then
+			echo "Mounting $UUID ($MOUNT) failed, exiting" >&2
+			exit 1
+		fi
+	fi
+	
+	eval "$command"
+
+	# then do cleanup after...
+	if ! $wasmounted; then
+		# must call lsof or umount fails sometimes... wtf...
+		lsof "/media/$UUID" >/dev/null
+		# this will fail if something else started using
+		# the windows partition - that's okay
+		udisks --unmount "/dev/disk/by-uuid/$UUID" >/dev/null
+	fi
+}
+
+while getopts 'hmuw' option; do
+	case "$option" in
+		h) echo "$USAGE"
+		   exit
+		   ;;
+		m) getConfig
+		   makeSymLink
+		   udisks --mount "/dev/disk/by-uuid/$UUID"
+		   ;;
+		u) getConfig
+		   udisks --unmount "/dev/disk/by-uuid/$UUID"
+		   ;;
+		w) shift $((OPTIND - 1))
+		   command="$@"
+		   wrap
+		   break
+		   ;;
+		?) printf "Unknown option: '%s'\n" "$OPTARG" >&2
+		   echo "$USAGE" >&2
+		   exit 1
+		   ;;
+	esac
+done
+
